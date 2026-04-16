@@ -1,26 +1,34 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "agent-starter",
+  "name": "cf-ai-cortexminutes",
   "main": "src/server.ts",
-  "compatibility_date": "2026-03-02",
+  "compatibility_date": "2025-04-01",
   "compatibility_flags": ["nodejs_compat"],
-  "ai": { "binding": "AI", "remote": true },
+
+  // Workers AI binding — access via env.AI
+  "ai": { "binding": "AI" },
+
+  // Static assets served by Cloudflare Pages-style hosting
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",
-    "run_worker_first": ["/agents/*", "/oauth/*"]
+    "run_worker_first": ["/agents/*", "/api/*"]
   },
+
+  // Durable Object binding for the per-team agent
   "durable_objects": {
     "bindings": [
       {
-        "class_name": "ChatAgent",
-        "name": "ChatAgent"
+        "class_name": "TeamAgent",
+        "name": "TeamAgent"
       }
     ]
   },
+
+  // SQLite-backed Durable Objects (not legacy KV storage)
   "migrations": [
     {
-      "new_sqlite_classes": ["ChatAgent"],
+      "new_sqlite_classes": ["TeamAgent"],
       "tag": "v1"
     }
   ]

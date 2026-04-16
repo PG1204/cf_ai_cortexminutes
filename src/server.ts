@@ -1,232 +1,176 @@
-import { createWorkersAI } from "workers-ai-provider";
-import { callable, routeAgentRequest, type Schedule } from "agents";
-import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { routeAgentRequest } from "agents";
 import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
-import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText,
-  tool,
-  type ModelMessage
-} from "ai";
-import { z } from "zod";
 
-/**
- * The AI SDK's downloadAssets step runs `new URL(data)` on every file
- * part's string data. Data URIs parse as valid URLs, so it tries to
- * HTTP-fetch them and fails. Decode to Uint8Array so the SDK treats
- * them as inline data instead.
- */
-function inlineDataUrls(messages: ModelMessage[]): ModelMessage[] {
-  return messages.map((msg) => {
-    if (msg.role !== "user" || typeof msg.content === "string") return msg;
-    return {
-      ...msg,
-      content: msg.content.map((part) => {
-        if (part.type !== "file" || typeof part.data !== "string") return part;
-        const match = part.data.match(/^data:([^;]+);base64,(.+)$/);
-        if (!match) return part;
-        const bytes = Uint8Array.from(atob(match[2]), (c) => c.charCodeAt(0));
-        return { ...part, data: bytes, mediaType: match[1] };
-      })
-    };
-  });
+// ── Types ────────────────────────────────────────────────────────────
+
+interface MeetingRow {
+  id: string;
+  title: string;
+  transcript: string;
+  summary: string;
+  created_at: string;
 }
 
-export class ChatAgent extends AIChatAgent<Env> {
+interface ActionItemRow {
+  id: number;
+  meeting_id: string;
+  description: string;
+  status: string;
+}
+
+// ── TeamAgent ────────────────────────────────────────────────────────
+//
+// Each team gets a distinct Durable Object instance (keyed by teamId),
+// backed by its own SQLite database. The Agents SDK provides `this.sql`
+// as the tagged-template SQL interface on SQLite-backed DOs.
+
+export class TeamAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
 
+  /**
+   * Initialize SQLite tables. Idempotent thanks to IF NOT EXISTS.
+   */
+  private ensureSchema() {
+    this.sql`
+      CREATE TABLE IF NOT EXISTS meetings (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        transcript TEXT NOT NULL,
+        summary TEXT NOT NULL DEFAULT '',
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `;
+    this.sql`
+      CREATE TABLE IF NOT EXISTS action_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        meeting_id TEXT NOT NULL REFERENCES meetings(id),
+        description TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending'
+      )
+    `;
+  }
+
+  /**
+   * Called once when the Durable Object is instantiated (or wakes from
+   * hibernation). Sets up the schema before any requests are handled.
+   */
   onStart() {
-    // Configure OAuth popup behavior for MCP servers that require authentication
-    this.mcp.configureOAuthCallback({
-      customHandler: (result) => {
-        if (result.authSuccess) {
-          return new Response("<script>window.close();</script>", {
-            headers: { "content-type": "text/html" },
-            status: 200
-          });
-        }
-        return new Response(
-          `Authentication Failed: ${result.authError || "Unknown error"}`,
-          { headers: { "content-type": "text/plain" }, status: 400 }
-        );
-      }
-    });
+    this.ensureSchema();
   }
 
-  @callable()
-  async addServer(name: string, url: string) {
-    return await this.addMcpServer(name, url);
+  // ── Meeting Ingestion ─────────────────────────────────────────────
+  //
+  // Called via RPC from the fetch handler. Inserts the meeting record
+  // and (in a later step) will call an LLM to produce a summary and
+  // extract action items.
+
+  async ingestMeeting(title: string, transcript: string): Promise<MeetingRow> {
+    this.ensureSchema();
+
+    const id = crypto.randomUUID();
+
+    // TODO: Call Llama 3.3 to generate summary + extract action items.
+    // For now, store with an empty summary and no action items.
+    const summary = "";
+
+    this.sql`
+      INSERT INTO meetings (id, title, transcript, summary)
+      VALUES (${id}, ${title}, ${transcript}, ${summary})
+    `;
+
+    // TODO: Parse LLM response and insert action items:
+    // this.sql`INSERT INTO action_items (meeting_id, description, status)
+    //          VALUES (${id}, ${desc}, ${"pending"})`;
+
+    return {
+      id,
+      title,
+      transcript,
+      summary,
+      created_at: new Date().toISOString(),
+    };
   }
 
-  @callable()
-  async removeServer(serverId: string) {
-    await this.removeMcpServer(serverId);
-  }
+  // ── Chat Q&A ──────────────────────────────────────────────────────
+  //
+  // Called by the Agents SDK when a WebSocket chat message arrives.
+  // Will later use streamText with tools (queryMeetings, listActionItems,
+  // completeActionItem) backed by the SQLite tables above.
 
-  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
-    const mcpTools = this.mcp.getAITools();
-    const workersai = createWorkersAI({ binding: this.env.AI });
-
-    const result = streamText({
-      model: workersai("@cf/moonshotai/kimi-k2.5", {
-        sessionAffinity: this.sessionAffinity
-      }),
-      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
-
-${getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.`,
-      // Prune old tool calls to save tokens on long conversations
-      messages: pruneMessages({
-        messages: inlineDataUrls(await convertToModelMessages(this.messages)),
-        toolCalls: "before-last-2-messages"
-      }),
-      tools: {
-        // MCP tools from connected servers
-        ...mcpTools,
-
-        // Server-side tool: runs automatically on the server
-        getWeather: tool({
-          description: "Get the current weather for a city",
-          inputSchema: z.object({
-            city: z.string().describe("City name")
-          }),
-          execute: async ({ city }) => {
-            // Replace with a real weather API in production
-            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
-            const temp = Math.floor(Math.random() * 30) + 5;
-            return {
-              city,
-              temperature: temp,
-              condition:
-                conditions[Math.floor(Math.random() * conditions.length)],
-              unit: "celsius"
-            };
-          }
-        }),
-
-        // Client-side tool: no execute function — the browser handles it
-        getUserTimezone: tool({
-          description:
-            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
-          inputSchema: z.object({})
-        }),
-
-        // Approval tool: requires user confirmation before executing
-        calculate: tool({
-          description:
-            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
-          inputSchema: z.object({
-            a: z.number().describe("First number"),
-            b: z.number().describe("Second number"),
-            operator: z
-              .enum(["+", "-", "*", "/", "%"])
-              .describe("Arithmetic operator")
-          }),
-          needsApproval: async ({ a, b }) =>
-            Math.abs(a) > 1000 || Math.abs(b) > 1000,
-          execute: async ({ a, b, operator }) => {
-            const ops: Record<string, (x: number, y: number) => number> = {
-              "+": (x, y) => x + y,
-              "-": (x, y) => x - y,
-              "*": (x, y) => x * y,
-              "/": (x, y) => x / y,
-              "%": (x, y) => x % y
-            };
-            if (operator === "/" && b === 0) {
-              return { error: "Division by zero" };
-            }
-            return {
-              expression: `${a} ${operator} ${b}`,
-              result: ops[operator](a, b)
-            };
-          }
-        }),
-
-        scheduleTask: tool({
-          description:
-            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
-          inputSchema: scheduleSchema,
-          execute: async ({ when, description }) => {
-            if (when.type === "no-schedule") {
-              return "Not a valid schedule input";
-            }
-            const input =
-              when.type === "scheduled"
-                ? when.date
-                : when.type === "delayed"
-                  ? when.delayInSeconds
-                  : when.type === "cron"
-                    ? when.cron
-                    : null;
-            if (!input) return "Invalid schedule type";
-            try {
-              this.schedule(input, "executeTask", description, {
-                idempotent: true
-              });
-              return `Task scheduled: "${description}" (${when.type}: ${input})`;
-            } catch (error) {
-              return `Error scheduling task: ${error}`;
-            }
-          }
-        }),
-
-        getScheduledTasks: tool({
-          description: "List all tasks that have been scheduled",
-          inputSchema: z.object({}),
-          execute: async () => {
-            const tasks = this.getSchedules();
-            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
-          }
-        }),
-
-        cancelScheduledTask: tool({
-          description: "Cancel a scheduled task by its ID",
-          inputSchema: z.object({
-            taskId: z.string().describe("The ID of the task to cancel")
-          }),
-          execute: async ({ taskId }) => {
-            try {
-              this.cancelSchedule(taskId);
-              return `Task ${taskId} cancelled.`;
-            } catch (error) {
-              return `Error cancelling task: ${error}`;
-            }
-          }
-        })
-      },
-      stopWhen: stepCountIs(5),
-      abortSignal: options?.abortSignal
-    });
-
-    return result.toUIMessageStreamResponse();
-  }
-
-  async executeTask(description: string, _task: Schedule<string>) {
-    // Do the actual work here (send email, call API, etc.)
-    console.log(`Executing scheduled task: ${description}`);
-
-    // Notify connected clients via a broadcast event.
-    // We use broadcast() instead of saveMessages() to avoid injecting
-    // into chat history — that would cause the AI to see the notification
-    // as new context and potentially loop.
-    this.broadcast(
-      JSON.stringify({
-        type: "scheduled-task",
-        description,
-        timestamp: new Date().toISOString()
-      })
-    );
+  async onChatMessage(_onFinish: unknown, _options?: OnChatMessageOptions) {
+    // TODO: Wire up Workers AI (Llama 3.3) with:
+    //   - System prompt describing CortexMinutes
+    //   - Tools that query/mutate the meetings & action_items tables
+    //   - streamText() returning a UI message stream response
+    return new Response("Chat not yet implemented", { status: 501 });
   }
 }
 
+// ── Worker Fetch Handler ─────────────────────────────────────────────
+//
+// Routes incoming requests:
+//   POST /api/team/:teamId/meetings  → meeting ingestion via DO RPC
+//   /agents/*                        → Agents SDK (WebSocket chat)
+//   Everything else                  → 404 (static assets handled by wrangler)
+
 export default {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Meeting ingestion API
+    if (request.method === "POST" && url.pathname.startsWith("/api/team/")) {
+      return handleMeetingIngestion(request, url, env);
+    }
+
+    // Agent WebSocket / chat routes — routeAgentRequest maps the
+    // request to the correct TeamAgent DO based on the agent name
+    // passed by the client (which we set to the teamId).
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })
     );
-  }
+  },
 } satisfies ExportedHandler<Env>;
+
+// ── API Route Handlers ───────────────────────────────────────────────
+
+async function handleMeetingIngestion(
+  request: Request,
+  url: URL,
+  env: Env,
+): Promise<Response> {
+  // Parse /api/team/:teamId/meetings
+  const segments = url.pathname.split("/");
+  const teamId = segments[3];
+
+  if (!teamId || segments[4] !== "meetings") {
+    return jsonError("Invalid route. Expected /api/team/:teamId/meetings", 400);
+  }
+
+  let body: { title?: string; transcript?: string };
+  try {
+    body = await request.json();
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  if (!body.title || typeof body.title !== "string" || !body.title.trim()) {
+    return jsonError("Missing or empty 'title' field", 400);
+  }
+  if (!body.transcript || typeof body.transcript !== "string" || !body.transcript.trim()) {
+    return jsonError("Missing or empty 'transcript' field", 400);
+  }
+
+  // Resolve the DO instance for this team — idFromName ensures
+  // the same teamId always maps to the same Durable Object.
+  const agentId = env.TeamAgent.idFromName(teamId);
+  const stub = env.TeamAgent.get(agentId);
+
+  const meeting = await stub.ingestMeeting(body.title.trim(), body.transcript.trim());
+
+  return Response.json({ success: true, meeting }, { status: 201 });
+}
+
+function jsonError(message: string, status: number): Response {
+  return Response.json({ success: false, error: message }, { status });
+}
