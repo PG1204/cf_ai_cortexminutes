@@ -41,6 +41,8 @@ CRITICAL RULES:
 3. After a tool returns data, summarize it in natural language. Never dump raw JSON.
 4. If a tool returns no data, say so honestly (e.g. "No completed action items found.").
 5. If a tool response has ok: false and an error string, politely explain that error to the user in natural language. Do not make up data.
+6. NEVER output raw JSON, function call syntax, or tool names in your text response. Do not write things like "Your function call is ..." or paste {"name": ...} into your reply. If you need to use a tool, invoke it through the tool-calling mechanism silently — the user must only see your natural-language answer.
+7. If a tool call fails or you are unsure how to use tools, do NOT mention tools, function calls, or internal errors to the user. Instead, answer directly from whatever context you have, or politely say you cannot access the information right now. Never expose internal implementation details.
 
 TOOL MAPPING — match the user's message to a tool call:
 - "Show pending action items" / "pending tasks" / "what are my action items" → listActionItems with status "pending"
@@ -230,6 +232,7 @@ export class TeamAgent extends AIChatAgent<Env> {
           "Get the single most recent meeting for this team. Use this when the user asks about the last meeting, most recent discussion, or what was discussed recently.",
         inputSchema: z.object({}),
         execute: async () => {
+          console.log("[tool] getLastMeeting called");
           try {
             const rows = this.sql<MeetingRow>`
               SELECT id, title, transcript, summary, created_at FROM meetings
@@ -267,6 +270,7 @@ export class TeamAgent extends AIChatAgent<Env> {
             .describe("Filter: 'pending' for open tasks, 'completed' for done tasks, 'all' for both"),
         }),
         execute: async ({ status }) => {
+          console.log("[tool] listActionItems called with status:", status);
           try {
             const rows =
               status === "all"
@@ -307,6 +311,7 @@ export class TeamAgent extends AIChatAgent<Env> {
           id: z.number().describe("The numeric ID of the action item to mark as completed"),
         }),
         execute: async ({ id }) => {
+          console.log("[tool] completeActionItem called with id:", id);
           try {
             const existing = this.sql<ActionItemRow>`
               SELECT id, description, status FROM action_items WHERE id = ${id}
@@ -348,6 +353,7 @@ export class TeamAgent extends AIChatAgent<Env> {
           query: z.string().describe("The keyword or phrase to search for"),
         }),
         execute: async ({ query }) => {
+          console.log("[tool] queryMeetings called with query:", query);
           try {
             const pattern = `%${query}%`;
             const rows = this.sql<MeetingRow>`
@@ -384,6 +390,7 @@ export class TeamAgent extends AIChatAgent<Env> {
           count: z.number().describe("How many recent meetings to return (use 5 as default)"),
         }),
         execute: async ({ count }) => {
+          console.log("[tool] getRecentMeetings called with count:", count);
           try {
             const limit = Math.max(1, Math.min(count, 20));
             const rows = this.sql<MeetingRow>`
@@ -488,6 +495,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
+    if (request.method === "POST" && url.pathname === "/api/transcribe") {
+      return handleTranscription(request, env);
+    }
+
     if (request.method === "POST" && url.pathname.startsWith("/api/team/")) {
       return handleMeetingIngestion(request, url, env);
     }
@@ -553,6 +564,45 @@ async function handleMeetingIngestion(
 
   const result = await stub.ingestMeeting(normalizedTitle, normalizedTranscript);
   return Response.json(result, { status: 200 });
+}
+
+async function handleTranscription(
+  request: Request,
+  env: Env,
+): Promise<Response> {
+  let formData: FormData;
+  try {
+    formData = await request.formData();
+  } catch {
+    return jsonError("Expected multipart form data with an 'audio' field", 400);
+  }
+
+  const audioFile = formData.get("audio");
+  if (!audioFile || !(audioFile instanceof File)) {
+    return jsonError("Missing 'audio' file in form data", 400);
+  }
+
+  const arrayBuffer = await audioFile.arrayBuffer();
+  if (arrayBuffer.byteLength === 0) {
+    return jsonError("Audio file is empty", 400);
+  }
+
+  try {
+    const result = await env.AI.run("@cf/openai/whisper" as Parameters<typeof env.AI.run>[0], {
+      audio: [...new Uint8Array(arrayBuffer)],
+    });
+
+    const text = (result as { text?: string }).text ?? "";
+    if (!text.trim()) {
+      return jsonError("Transcription produced no text. Try speaking more clearly.", 422);
+    }
+
+    return Response.json({ text: text.trim() });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[API][transcribe] Workers AI error:", msg);
+    return jsonError("Transcription failed. Please try again.", 502);
+  }
 }
 
 function jsonError(message: string, status: number): Response {

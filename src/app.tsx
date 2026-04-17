@@ -30,6 +30,7 @@ import {
   UsersIcon,
   ArrowsClockwiseIcon,
   LightningIcon,
+  MicrophoneIcon,
 } from "@phosphor-icons/react";
 
 // ── Constants ────────────────────────────────────────────────────────
@@ -72,21 +73,25 @@ function ThemeToggle() {
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
-/** Detect text that is really a raw tool-call JSON blob Llama sometimes emits as plain text */
-function isRawToolCallText(text: string): boolean {
-  const trimmed = text.trim();
-  if (!trimmed.startsWith("{")) return false;
-  try {
-    const parsed = JSON.parse(trimmed);
-    // Llama tool-call format: {"name": "...", "parameters": {...}}
-    if (typeof parsed === "object" && parsed !== null && "name" in parsed && "parameters" in parsed) {
-      return true;
-    }
-  } catch {
-    // not valid JSON — not a tool call
-  }
+/**
+ * Detect assistant text that is really a leaked tool-call from Llama.
+ * Covers multiple patterns the model uses:
+ *   - Pure JSON: {"name": "getLastMeeting", "parameters": {}}
+ *   - Wrapped:   "Your function call is {"name": ...}"
+ *   - Refusals that reference missing tool responses
+ */
+function isLeakedToolCall(text: string): boolean {
+  // Pattern 1: contains a JSON-shaped tool call anywhere in the string
+  if (/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"parameters"\s*:/.test(text)) return true;
+  // Pattern 2: model narrates the function call
+  if (/function.?call/i.test(text) && /"name"/.test(text)) return true;
+  // Pattern 3: model says it didn't receive a tool response
+  if (/didn.t receive a tool.call response/i.test(text)) return true;
   return false;
 }
+
+const LEAKED_TOOL_CALL_FALLBACK =
+  "I encountered an issue looking that up. Could you please rephrase your request?";
 
 // ── Tool rendering ────────────────────────────────────────────────────
 // Tools are internal agent operations — we show only a subtle indicator,
@@ -217,6 +222,28 @@ function TeamSelector({
   );
 }
 
+// ── Transcription helper ─────────────────────────────────────────────
+
+async function transcribeAudio(blob: Blob): Promise<string> {
+  const form = new FormData();
+  form.append("audio", blob, "recording.webm");
+
+  const res = await fetch("/api/transcribe", { method: "POST", body: form });
+
+  let data: { text?: string; error?: string };
+  try {
+    data = await res.json();
+  } catch {
+    throw new Error(res.ok ? "Transcription returned invalid JSON" : `Transcription failed (HTTP ${res.status})`);
+  }
+
+  if (!res.ok || !data.text) {
+    throw new Error(data.error ?? `Transcription failed (HTTP ${res.status})`);
+  }
+
+  return data.text;
+}
+
 // ── Meeting Ingestion Panel ───────────────────────────────────────────
 
 function MeetingPanel({ teamId }: { teamId: string }) {
@@ -226,6 +253,12 @@ function MeetingPanel({ teamId }: { teamId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
+  // Voice recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const chunksRef = useRef<BlobPart[]>([]);
+
   interface IngestionResponse {
     success: boolean;
     meetingId?: string;
@@ -234,6 +267,64 @@ function MeetingPanel({ teamId }: { teamId: string }) {
     aiProcessed?: boolean;
     error?: string;
   }
+
+  const startRecording = useCallback(async () => {
+    setError(null);
+    setSuccess(null);
+
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch {
+      setError("Microphone access denied. Please allow microphone access and try again.");
+      return;
+    }
+
+    chunksRef.current = [];
+    const recorder = new MediaRecorder(stream);
+    mediaRecorderRef.current = recorder;
+
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        chunksRef.current.push(e.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      // Stop all tracks so the browser mic indicator goes away
+      stream.getTracks().forEach((t) => t.stop());
+
+      const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+      chunksRef.current = [];
+
+      if (blob.size === 0) {
+        setError("Recording was empty. Please try again.");
+        return;
+      }
+
+      setTranscribing(true);
+      try {
+        const text = await transcribeAudio(blob);
+        setTranscript((prev) =>
+          prev.trim() ? `${prev.trim()}\n\n${text}` : text,
+        );
+        setSuccess("Voice transcription added to transcript.");
+      } catch (err) {
+        console.error("Transcription error:", err);
+        setError(err instanceof Error ? err.message : "Transcription failed.");
+      } finally {
+        setTranscribing(false);
+      }
+    };
+
+    recorder.start();
+    setIsRecording(true);
+  }, []);
+
+  const stopRecording = useCallback(() => {
+    mediaRecorderRef.current?.stop();
+    setIsRecording(false);
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -284,6 +375,8 @@ function MeetingPanel({ teamId }: { teamId: string }) {
     }
   };
 
+  const busy = submitting || isRecording || transcribing;
+
   return (
     <Surface className="p-4 rounded-xl ring ring-kumo-line">
       <div className="flex items-center gap-2 mb-3">
@@ -309,10 +402,38 @@ function MeetingPanel({ teamId }: { teamId: string }) {
             setTranscript(e.target.value);
             setSuccess(null);
           }}
-          placeholder="Paste meeting transcript here..."
+          placeholder="Paste meeting transcript or use voice recording..."
           rows={5}
           className="w-full px-3 py-2 text-sm rounded-lg border border-kumo-line bg-kumo-base text-kumo-default placeholder:text-kumo-inactive focus:outline-none focus:ring-1 focus:ring-kumo-accent resize-y"
         />
+        {/* Voice recording button */}
+        <button
+          type="button"
+          disabled={submitting || transcribing}
+          onClick={isRecording ? stopRecording : startRecording}
+          className={`w-full flex items-center justify-center gap-2 px-3 py-2 text-sm rounded-lg border transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+            isRecording
+              ? "border-red-300 dark:border-red-700 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400"
+              : "border-kumo-line bg-kumo-base text-kumo-default hover:bg-kumo-elevated"
+          }`}
+        >
+          {isRecording ? (
+            <>
+              <CircleIcon size={10} weight="fill" className="text-red-500 animate-pulse" />
+              Stop recording
+            </>
+          ) : transcribing ? (
+            <>
+              <GearIcon size={14} className="text-kumo-inactive animate-spin" />
+              Transcribing...
+            </>
+          ) : (
+            <>
+              <MicrophoneIcon size={14} />
+              Record voice transcript
+            </>
+          )}
+        </button>
         {error && (
           <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800">
             <span className="text-xs text-red-600 dark:text-red-400">
@@ -339,7 +460,7 @@ function MeetingPanel({ teamId }: { teamId: string }) {
           variant="primary"
           size="sm"
           className="w-full"
-          disabled={submitting || !title.trim() || !transcript.trim()}
+          disabled={busy || !title.trim() || !transcript.trim()}
         >
           {submitting ? "Ingesting..." : "Ingest Transcript"}
         </Button>
@@ -535,8 +656,20 @@ function TeamWorkspace({
                         ).text;
                         if (!text) return null;
 
-                        // Skip raw tool-call JSON that Llama sometimes emits as plain text
-                        if (!isUser && isRawToolCallText(text)) return null;
+                        if (!isUser) {
+                          console.log("ASSISTANT RAW TEXT:", text);
+                        }
+
+                        // Replace leaked tool-call text with a friendly fallback
+                        if (!isUser && isLeakedToolCall(text)) {
+                          return (
+                            <div key={i} className="flex justify-start">
+                              <div className="max-w-[85%] rounded-2xl rounded-bl-md bg-kumo-base text-kumo-default leading-relaxed px-4 py-2.5 text-sm">
+                                {LEAKED_TOOL_CALL_FALLBACK}
+                              </div>
+                            </div>
+                          );
+                        }
 
                         if (isUser) {
                           return (
