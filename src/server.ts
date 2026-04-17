@@ -17,6 +17,9 @@ import { z } from "zod";
 const LLAMA_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 const FALLBACK_MODEL = "@cf/meta/llama-3.1-8b-instruct";
 
+const MAX_TITLE_LENGTH = 200;
+const MAX_TRANSCRIPT_LENGTH = 10_000;
+
 const INGESTION_SYSTEM_PROMPT = `You process meeting transcripts. Respond with valid JSON only — no markdown fences, no commentary, no extra text.
 
 Return exactly this shape:
@@ -37,6 +40,7 @@ CRITICAL RULES:
 2. You ALWAYS have the right tool available. NEVER say "your request is incomplete", "I need more details", or "my functions are insufficient". If a user message mentions meetings or action items, call the matching tool immediately.
 3. After a tool returns data, summarize it in natural language. Never dump raw JSON.
 4. If a tool returns no data, say so honestly (e.g. "No completed action items found.").
+5. If a tool response has ok: false and an error string, politely explain that error to the user in natural language. Do not make up data.
 
 TOOL MAPPING — match the user's message to a tool call:
 - "Show pending action items" / "pending tasks" / "what are my action items" → listActionItems with status "pending"
@@ -52,6 +56,13 @@ RESPONSE FORMAT:
 - Format action items as "**#ID**: description (status)".
 - Keep answers concise and professional.
 - Use markdown bullet points for lists.`;
+
+// ── Schemas ──────────────────────────────────────────────────────────
+
+const IngestionSchema = z.object({
+  summary: z.string(),
+  actionItems: z.array(z.string()),
+});
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -71,10 +82,38 @@ interface ActionItemRow {
 }
 
 interface IngestionResult {
+  success: true;
   meetingId: string;
   summary: string;
   actionItems: string[];
   aiProcessed: boolean;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Extracts the first well-formed JSON object from model output that may
+ * include markdown fences, preamble text, or trailing commentary.
+ */
+function safeParseIngestionJson(text: string): unknown {
+  const trimmed = text.trim();
+
+  // Fast path: the whole string is the JSON object
+  if (trimmed.startsWith("{")) {
+    try {
+      return JSON.parse(trimmed);
+    } catch {
+      // fall through to regex extraction
+    }
+  }
+
+  // Slow path: find the first { ... } block (non-greedy to avoid spanning multiple objects)
+  const match = trimmed.match(/\{[\s\S]*?\}/);
+  if (!match) {
+    throw new Error("No JSON object found in AI response");
+  }
+
+  return JSON.parse(match[0]);
 }
 
 // ── TeamAgent ────────────────────────────────────────────────────────
@@ -122,14 +161,14 @@ export class TeamAgent extends AIChatAgent<Env> {
     const workersai = createWorkersAI({ binding: this.env.AI });
     const prompt = `Meeting title: ${title}\n\nTranscript:\n${transcript}`;
 
-    const aiResult = await this.tryGenerateSummary(workersai, LLAMA_MODEL, prompt)
-      ?? await this.tryGenerateSummary(workersai, FALLBACK_MODEL, prompt);
+    const aiResult =
+      (await this.tryGenerateSummary(workersai, LLAMA_MODEL, prompt)) ??
+      (await this.tryGenerateSummary(workersai, FALLBACK_MODEL, prompt));
 
     if (!aiResult) {
-      // Both models failed — degrade gracefully
       const placeholder = "AI summarization temporarily unavailable.";
       this.sql`UPDATE meetings SET summary = ${placeholder} WHERE id = ${meetingId}`;
-      return { meetingId, summary: placeholder, actionItems: [], aiProcessed: false };
+      return { success: true, meetingId, summary: placeholder, actionItems: [], aiProcessed: false };
     }
 
     const { summary, actionItems } = aiResult;
@@ -144,7 +183,7 @@ export class TeamAgent extends AIChatAgent<Env> {
       `;
     }
 
-    return { meetingId, summary, actionItems, aiProcessed: true };
+    return { success: true, meetingId, summary, actionItems, aiProcessed: true };
   }
 
   private async tryGenerateSummary(
@@ -159,26 +198,31 @@ export class TeamAgent extends AIChatAgent<Env> {
         prompt,
       });
 
-      const parsed = JSON.parse(text);
-      const summary = typeof parsed.summary === "string" ? parsed.summary : "";
-      const actionItems = Array.isArray(parsed.actionItems)
-        ? parsed.actionItems.filter(
-            (item: unknown): item is string =>
-              typeof item === "string" && item.trim() !== "",
-          )
-        : [];
+      const raw = safeParseIngestionJson(text);
+      const result = IngestionSchema.safeParse(raw);
 
-      return { summary, actionItems };
+      if (!result.success) {
+        console.error(
+          `[AI][ingest] invalid JSON shape (${model}):`,
+          result.error.message,
+        );
+        return null;
+      }
+
+      const actionItems = result.data.actionItems.filter(
+        (item) => item.trim() !== "",
+      );
+
+      return { summary: result.data.summary, actionItems };
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`AI call failed (${model}):`, errMsg);
+      console.error(`[AI][ingest] call failed (${model}):`, errMsg);
       return null;
     }
   }
 
   // ── Chat Q&A ──────────────────────────────────────────────────────
 
-  // Shared tool definitions — used by onChatMessage
   private get chatTools() {
     return {
       getLastMeeting: tool({
@@ -193,21 +237,23 @@ export class TeamAgent extends AIChatAgent<Env> {
             `;
 
             if (rows.length === 0) {
-              return { found: false, message: "No meetings have been ingested yet." };
+              return { ok: false, error: "No meetings have been ingested yet." };
             }
 
             const m = rows[0];
             return {
-              found: true,
-              id: m.id,
-              title: m.title,
-              summary: m.summary,
-              createdAt: m.created_at,
-              transcriptSnippet: m.transcript.slice(0, 500),
+              ok: true,
+              data: {
+                id: m.id,
+                title: m.title,
+                summary: m.summary,
+                createdAt: m.created_at,
+                transcriptSnippet: m.transcript.slice(0, 500),
+              },
             };
           } catch (err) {
-            console.error("getLastMeeting failed:", err);
-            return { found: false, message: "Failed to fetch the last meeting." };
+            console.error("[tool] getLastMeeting failed:", err);
+            return { ok: false, error: "Failed to fetch the last meeting." };
           }
         },
       }),
@@ -235,21 +281,22 @@ export class TeamAgent extends AIChatAgent<Env> {
                   `;
 
             if (rows.length === 0) {
-              return { found: false, message: `No ${status} action items found.` };
+              return { ok: false, error: `No ${status} action items found.` };
             }
             return {
-              found: true,
-              count: rows.length,
-              items: rows.map((r) => ({
-                id: r.id,
-                meetingId: r.meeting_id,
-                description: r.description,
-                status: r.status,
-              })),
+              ok: true,
+              data: {
+                items: rows.map((r) => ({
+                  id: r.id,
+                  description: r.description,
+                  status: r.status,
+                  meetingId: r.meeting_id,
+                })),
+              },
             };
           } catch (err) {
-            console.error("listActionItems failed:", err);
-            return { found: false, message: "Failed to query action items." };
+            console.error("[tool] listActionItems failed:", err);
+            return { ok: false, error: "Failed to query action items." };
           }
         },
       }),
@@ -266,21 +313,30 @@ export class TeamAgent extends AIChatAgent<Env> {
             `;
 
             if (existing.length === 0) {
-              return { success: false, message: `Action item #${id} not found.` };
+              return { ok: false, error: `Action item #${id} not found.` };
             }
             if (existing[0].status === "completed") {
-              return { success: true, message: `Action item #${id} is already completed.` };
+              return {
+                ok: true,
+                data: {
+                  message: `Action item #${id} is already completed.`,
+                  updatedItem: { id: existing[0].id, description: existing[0].description, status: "completed" },
+                },
+              };
             }
 
             this.sql`UPDATE action_items SET status = ${"completed"} WHERE id = ${id}`;
 
             return {
-              success: true,
-              message: `Marked #${id} ("${existing[0].description}") as completed.`,
+              ok: true,
+              data: {
+                message: `Marked #${id} ("${existing[0].description}") as completed.`,
+                updatedItem: { id: existing[0].id, description: existing[0].description, status: "completed" },
+              },
             };
           } catch (err) {
-            console.error("completeActionItem failed:", err);
-            return { success: false, message: "Failed to update action item." };
+            console.error("[tool] completeActionItem failed:", err);
+            return { ok: false, error: "Failed to update action item." };
           }
         },
       }),
@@ -301,27 +357,29 @@ export class TeamAgent extends AIChatAgent<Env> {
             `;
 
             if (rows.length === 0) {
-              return { found: false, message: `No meetings found matching "${query}".` };
+              return { ok: false, error: `No meetings found matching "${query}".` };
             }
             return {
-              found: true,
-              count: rows.length,
-              meetings: rows.map((r) => ({
-                id: r.id,
-                title: r.title,
-                summary: r.summary,
-                createdAt: r.created_at,
-              })),
+              ok: true,
+              data: {
+                meetings: rows.map((r) => ({
+                  id: r.id,
+                  title: r.title,
+                  summary: r.summary,
+                  createdAt: r.created_at,
+                })),
+              },
             };
           } catch (err) {
-            console.error("queryMeetings failed:", err);
-            return { found: false, message: "Failed to search meetings." };
+            console.error("[tool] queryMeetings failed:", err);
+            return { ok: false, error: "Failed to search meetings." };
           }
         },
       }),
 
       getRecentMeetings: tool({
-        description: "Get a list of the most recent meetings for this team. Call this when the user says 'show recent meetings', 'latest meetings', or asks what meetings have happened. Use count 5 as a sensible default.",
+        description:
+          "Get a list of the most recent meetings for this team. Call this when the user says 'show recent meetings', 'latest meetings', or asks what meetings have happened. Use count 5 as a sensible default.",
         inputSchema: z.object({
           count: z.number().describe("How many recent meetings to return (use 5 as default)"),
         }),
@@ -334,21 +392,22 @@ export class TeamAgent extends AIChatAgent<Env> {
             `;
 
             if (rows.length === 0) {
-              return { found: false, message: "No meetings have been ingested yet." };
+              return { ok: false, error: "No meetings have been ingested yet." };
             }
             return {
-              found: true,
-              count: rows.length,
-              meetings: rows.map((r) => ({
-                id: r.id,
-                title: r.title,
-                summary: r.summary,
-                createdAt: r.created_at,
-              })),
+              ok: true,
+              data: {
+                meetings: rows.map((r) => ({
+                  id: r.id,
+                  title: r.title,
+                  summary: r.summary,
+                  createdAt: r.created_at,
+                })),
+              },
             };
           } catch (err) {
-            console.error("getRecentMeetings failed:", err);
-            return { found: false, message: "Failed to fetch recent meetings." };
+            console.error("[tool] getRecentMeetings failed:", err);
+            return { ok: false, error: "Failed to fetch recent meetings." };
           }
         },
       }),
@@ -377,7 +436,7 @@ export class TeamAgent extends AIChatAgent<Env> {
       return text;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`AI chat error (${model}):`, msg);
+      console.error(`[AI][chat] error (${model}):`, msg);
       return null;
     }
   }
@@ -416,7 +475,9 @@ export class TeamAgent extends AIChatAgent<Env> {
       );
     }
 
-    const finalText = text.trim() || "I looked up the data but couldn't generate a response. Please try asking again.";
+    const finalText =
+      text.trim() ||
+      "I looked up the data but couldn't generate a response. Please try asking again.";
     return this.sendTextResponse(finalText);
   }
 }
@@ -467,19 +528,30 @@ async function handleMeetingIngestion(
     !("transcript" in body) ||
     typeof (body as Record<string, unknown>).transcript !== "string"
   ) {
-    return jsonError("Invalid request body", 400);
+    return jsonError("Invalid request body: expected { title: string, transcript: string }", 400);
   }
 
   const { title, transcript } = body as { title: string; transcript: string };
+  const normalizedTitle = title.trim();
+  const normalizedTranscript = transcript.trim();
 
-  if (!title.trim() || !transcript.trim()) {
-    return jsonError("Invalid request body", 400);
+  if (!normalizedTitle) {
+    return jsonError("Title is required", 400);
+  }
+  if (!normalizedTranscript) {
+    return jsonError("Transcript is required", 400);
+  }
+  if (normalizedTitle.length > MAX_TITLE_LENGTH) {
+    return jsonError(`Title too long (max ${MAX_TITLE_LENGTH} characters)`, 400);
+  }
+  if (normalizedTranscript.length > MAX_TRANSCRIPT_LENGTH) {
+    return jsonError(`Transcript too long (max ${MAX_TRANSCRIPT_LENGTH} characters)`, 400);
   }
 
   const agentId = env.TeamAgent.idFromName(teamId);
   const stub = env.TeamAgent.get(agentId);
 
-  const result = await stub.ingestMeeting(title.trim(), transcript.trim());
+  const result = await stub.ingestMeeting(normalizedTitle, normalizedTranscript);
   return Response.json(result, { status: 200 });
 }
 

@@ -103,7 +103,7 @@ const TOOL_LABELS: Record<string, string> = {
 function ToolPartView({ part }: { part: UIMessage["parts"][number] }) {
   if (!isToolUIPart(part)) return null;
   const toolName = getToolName(part);
-  const label = TOOL_LABELS[toolName] ?? toolName;
+  const label = TOOL_LABELS[toolName] ?? "Running tool";
 
   // Tool finished — show a collapsed one-liner (no JSON output)
   if (part.state === "output-available") {
@@ -226,6 +226,15 @@ function MeetingPanel({ teamId }: { teamId: string }) {
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
+  interface IngestionResponse {
+    success: boolean;
+    meetingId?: string;
+    summary?: string;
+    actionItems?: string[];
+    aiProcessed?: boolean;
+    error?: string;
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title.trim() || !transcript.trim()) return;
@@ -247,27 +256,23 @@ function MeetingPanel({ teamId }: { teamId: string }) {
         },
       );
 
-      if (!res.ok) {
-        let errorMsg = `HTTP ${res.status}`;
-        try {
-          const data = (await res.json()) as { error?: string };
-          if (data.error) errorMsg = data.error;
-        } catch {
-          // response body wasn't JSON
-        }
-        throw new Error(errorMsg);
-      }
-
-      let data: { meetingId: string; summary: string; actionItems: string[] };
+      let data: IngestionResponse;
       try {
         data = await res.json();
       } catch {
-        throw new Error("Server returned invalid JSON");
+        throw new Error(res.ok ? "Server returned invalid JSON" : `HTTP ${res.status}`);
       }
 
-      const itemCount = data.actionItems.length;
+      if (!res.ok || data.success === false) {
+        throw new Error(data.error ?? `HTTP ${res.status}`);
+      }
+
+      const itemCount = data.actionItems?.length ?? 0;
+      const aiNote = data.aiProcessed === false
+        ? " (AI summarization temporarily unavailable)"
+        : "";
       setSuccess(
-        `"${title.trim()}" ingested — ${itemCount} action item${itemCount !== 1 ? "s" : ""} extracted.`,
+        `"${title.trim()}" ingested — ${itemCount} action item${itemCount !== 1 ? "s" : ""} extracted${aiNote}.`,
       );
       setTitle("");
       setTranscript("");
@@ -336,7 +341,7 @@ function MeetingPanel({ teamId }: { teamId: string }) {
           className="w-full"
           disabled={submitting || !title.trim() || !transcript.trim()}
         >
-          {submitting ? "Processing..." : "Ingest Transcript"}
+          {submitting ? "Ingesting..." : "Ingest Transcript"}
         </Button>
       </form>
     </Surface>
@@ -502,8 +507,9 @@ function TeamWorkspace({
                   title={`Welcome to ${teamId}'s space`}
                   contents={
                     <Text variant="secondary" size="sm">
-                      Ingest meeting transcripts, then ask questions about
-                      them. Use the quick actions on the right to get started.
+                      Ingest meeting transcripts, then ask about what was
+                      discussed or what action items are pending. Use the
+                      quick actions on the right to get started.
                     </Text>
                   }
                 />
